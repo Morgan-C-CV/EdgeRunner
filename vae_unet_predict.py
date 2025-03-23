@@ -424,7 +424,7 @@ def main():
     vae_config_path = "/dev/shm/fine_tuned_vae1/model_config.pth"
     
     batch_size = 8
-    epochs = 35
+    epochs = 20
     target_size = (256, 256)
     max_samples = None
 
@@ -432,7 +432,7 @@ def main():
     originals, images, masks = load_dataset_paths(dataset_path, max_samples)
 
     # 划分训练集和验证集
-    split_idx = int(len(originals) * 0.9)  # 90%用于训练，10%用于验证
+    split_idx = int(len(originals) * 0.8)  # 90%用于训练，10%用于验证
     train_originals, val_originals = originals[:split_idx], originals[split_idx:]
     train_images, val_images = images[:split_idx], images[split_idx:]
     train_masks, val_masks = masks[:split_idx], masks[split_idx:]
@@ -452,7 +452,7 @@ def main():
     unet_model = train_unet(unet_model, vae_model, train_loader, val_loader, epochs)
 
     # 保存U-Net模型
-    torch.save(unet_model.state_dict(), "unet_model2.pth")
+    torch.save(unet_model.state_dict(), "unet_model3.pth")
     print("U-Net模型已保存")
 
     for i in range(10):

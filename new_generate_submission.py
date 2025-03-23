@@ -11,6 +11,137 @@ import torch.nn as nn
 # 从vae_unet_predict.py导入相关函数和模型
 from vae_unet_predict import UNet, compute_reconstruction_error
 
+# 添加ImprovedUNet相关类定义
+# 定义注意力模块
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out) * x
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), "kernel size must be 3 or 7"
+        padding = 3 if kernel_size == 7 else 1
+        
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_concat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(x_concat)
+        return self.sigmoid(out) * x
+
+# 改进后的双卷积块，增加Dropout、残差连接和注意力机制
+class ImprovedDoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout_rate=0.2, use_attention=True):
+        super(ImprovedDoubleConv, self).__init__()
+        self.use_residual = (in_channels == out_channels)
+        self.use_attention = use_attention
+        
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        if self.use_residual:
+            self.residual_conv = nn.Identity()
+        else:
+            self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+        
+        if use_attention:
+            self.channel_attention = ChannelAttention(out_channels)
+            self.spatial_attention = SpatialAttention()
+    
+    def forward(self, x):
+        residual = self.residual_conv(x)
+        out = self.conv(x)
+        
+        if self.use_attention:
+            out = self.channel_attention(out)
+            out = self.spatial_attention(out)
+        
+        if self.use_residual:
+            out = out + residual
+            
+        return out
+
+# 改进的UNet模型，增加深度、注意力机制和Dropout
+class ImprovedUNet(nn.Module):
+    def __init__(self, in_channels=4, out_channels=1, dropout_rate=0.3, features=[64, 128, 256, 512]):
+        super(ImprovedUNet, self).__init__()
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Down part
+        in_channels_down = in_channels
+        for feature in features:
+            self.downs.append(ImprovedDoubleConv(in_channels_down, feature, dropout_rate))
+            in_channels_down = feature
+        
+        # Bottleneck
+        self.bottleneck = ImprovedDoubleConv(features[-1], features[-1]*2, dropout_rate)
+        
+        # Up part
+        for feature in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2))
+            self.ups.append(ImprovedDoubleConv(feature*2, feature, dropout_rate))
+        
+        # Final convolution
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        skip_connections = []
+        
+        # Down path
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+        
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]  # Reverse
+        
+        # Up path
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)  # Upsample
+            skip_connection = skip_connections[idx//2]
+            
+            # Handle if shapes don't match exactly (if needed)
+            if x.shape != skip_connection.shape:
+                x = nn.functional.interpolate(
+                    x, size=skip_connection.shape[2:], mode="bilinear", align_corners=True
+                )
+                
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx+1](concat_skip)  # Double Conv
+        
+        x = self.final_conv(x)
+        return self.sigmoid(x)
+
 # 尝试导入改进的VAE加载函数
 try:
     from resave_vae import load_saved_vae
@@ -296,7 +427,7 @@ def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
 def main():
     # 配置路径
     test_dir = "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1/test/test"
-    unet_model_path = "unet_model2.pth" 
+    unet_model_path = "unet_model_epoch_28.pth"
     
     # 使用新的VAE模型路径，与unet_validate.py一致
     vae_model_path = "/dev/shm/fine_tuned_vae1/vae_model.pth"
@@ -320,7 +451,7 @@ def main():
     
     # 处理UNet模型路径 - 与unet_validate.py一致的查找顺序
     if not os.path.exists(unet_model_path):
-        alt_paths = ["unet_model.pth", "best_unet_model.pth", "final_unet_model.pth"]
+        alt_paths = ["unet_model.pth", "best_unet_model.pth", "final_unet_model.pth", "improved_unet_model.pth"]
         for alt_path in alt_paths:
             if os.path.exists(alt_path):
                 unet_model_path = alt_path
@@ -344,10 +475,12 @@ def main():
     
     batch_size = 8
     target_size = (256, 256)
-    threshold = 0.8242
-
+    threshold = 0.6
+    
+    # 加载测试集路径
     test_images_paths = load_test_images(test_dir)
-
+    
+    # 创建测试数据集和数据加载器
     test_dataset = TestDataset(test_images_paths, target_size)
     test_loader = DataLoader(
         test_dataset, 
@@ -356,23 +489,72 @@ def main():
         num_workers=4, 
         pin_memory=True
     )
-
+    
+    # 加载模型
     print("加载模型...")
-
+    
+    # 加载VAE模型 - 使用新的加载函数
     vae_model = load_vae_model(vae_model_path, vae_config_path, input_shape=(3, *target_size))
-
-    unet_model = UNet(in_channels=4, out_channels=1).to(device)
+    
+    # 智能检测模型类型
+    def detect_model_type(model_path):
+        try:
+            state_dict = torch.load(model_path, map_location=device)
+            # 检查状态字典的键，判断是哪种模型架构
+            if any("downs." in key for key in state_dict.keys()):
+                print(f"检测到ImprovedUNet架构模型: {model_path}")
+                return "ImprovedUNet"
+            else:
+                print(f"检测到标准UNet架构模型: {model_path}")
+                return "UNet"
+        except Exception as e:
+            print(f"无法检测模型类型: {e}")
+            return "Unknown"
+    
+    # 检测并加载正确的UNet模型
+    model_type = detect_model_type(unet_model_path)
+    
+    if model_type == "ImprovedUNet":
+        print("创建ImprovedUNet模型实例...")
+        unet_model = ImprovedUNet(in_channels=4, out_channels=1, dropout_rate=0.3).to(device)
+    else:
+        print("创建标准UNet模型实例...")
+        unet_model = UNet(in_channels=4, out_channels=1).to(device)
+    
     try:
         unet_model.load_state_dict(torch.load(unet_model_path, map_location=device))
         print(f"UNet模型加载成功: {unet_model_path}")
     except Exception as e:
         print(f"加载UNet模型时出错: {e}")
-        # 尝试非严格加载
-        try:
-            unet_model.load_state_dict(torch.load(unet_model_path, map_location=device), strict=False)
-            print(f"UNet模型使用非严格模式加载成功: {unet_model_path}")
-        except Exception as e:
-            print(f"非严格加载UNet模型时出错: {e}")
+        
+        # 如果加载失败，尝试更多的模型路径
+        alternative_paths = ["unet_model.pth", "improved_unet_model.pth", "unet_model2.pth"]
+        for path in alternative_paths:
+            if os.path.exists(path) and path != unet_model_path:
+                try:
+                    # 检测模型类型
+                    alt_model_type = detect_model_type(path)
+                    
+                    # 如果与当前模型类型不匹配，创建新的模型实例
+                    if alt_model_type != model_type:
+                        if alt_model_type == "ImprovedUNet":
+                            print(f"切换到ImprovedUNet模型架构以加载: {path}")
+                            unet_model = ImprovedUNet(in_channels=4, out_channels=1, dropout_rate=0.3).to(device)
+                        else:
+                            print(f"切换到标准UNet模型架构以加载: {path}")
+                            unet_model = UNet(in_channels=4, out_channels=1).to(device)
+                    
+                    # 尝试加载模型权重
+                    unet_model.load_state_dict(torch.load(path, map_location=device))
+                    print(f"成功从替代路径加载UNet模型: {path}")
+                    break
+                except Exception as alt_e:
+                    print(f"从替代路径 {path} 加载模型失败: {alt_e}")
+                    continue
+        
+        # 检查模型是否成功加载
+        if not hasattr(unet_model, 'state_dict') or len(unet_model.state_dict()) == 0:
+            print("所有模型加载尝试均失败，程序退出")
             return
     
     # 预测掩码 - 使用固定阈值
