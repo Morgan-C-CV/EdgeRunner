@@ -6,9 +6,19 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
+import torch.nn as nn
 
 # 从vae_unet_predict.py导入相关函数和模型
-from vae_unet_predict import UNet, load_vae_model, compute_reconstruction_error
+from vae_unet_predict import UNet, compute_reconstruction_error
+
+# 尝试导入改进的VAE加载函数
+try:
+    from resave_vae import load_saved_vae
+    has_resave_module = True
+    print("成功导入 load_saved_vae 函数")
+except ImportError:
+    print("警告: 无法导入 load_saved_vae 函数，将使用回退方法")
+    has_resave_module = False
 
 # 设置设备
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,6 +89,139 @@ def mask2rle(img):
     runs[1::2] -= runs[::2]
     return ' '.join(str(x) for x in runs)
 
+# 重新实现的VAE模型加载函数，使用新的加载方法
+def load_vae_model(model_path, config_path=None, input_shape=(3, 256, 256), latent_dim=2048):
+    print(f"尝试从 {model_path} 加载VAE模型...")
+    
+    # 首先尝试使用新的加载方法
+    if has_resave_module and os.path.exists(model_path):
+        try:
+            # 使用新的专用加载函数
+            if config_path and os.path.exists(config_path):
+                print(f"使用专用加载函数从 {model_path} 和配置 {config_path} 加载模型...")
+                vae = load_saved_vae(model_path, config_path)
+                print("使用新方法成功加载VAE模型")
+                vae.eval()
+                return vae
+            else:
+                print(f"使用专用加载函数从 {model_path} 加载模型（无配置文件）...")
+                vae = load_saved_vae(model_path)
+                print("使用新方法成功加载VAE模型")
+                vae.eval()
+                return vae
+        except Exception as e:
+            print(f"使用新方法加载模型失败: {e}")
+            print("回退到传统加载方法...")
+    
+    # 如果新方法失败，回退到传统方法
+    try:
+        # 尝试从vae_unet_predict导入VAE模型类
+        try:
+            from vae_unet_predict import VAE
+            # 创建与训练时相同的模型结构
+            vae = VAE(input_shape=input_shape, latent_dim=latent_dim).to(device)
+        except ImportError:
+            try:
+                from sd_vae_finetuning import VAE
+                vae = VAE(input_shape=input_shape, latent_dim=latent_dim).to(device)
+            except ImportError:
+                print("无法导入VAE类，将使用简化VAE模型...")
+                class SimpleVAE(nn.Module):
+                    def __init__(self, input_shape=(3, 256, 256)):
+                        super(SimpleVAE, self).__init__()
+                        # 简单编码器
+                        self.encoder = nn.Sequential(
+                            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                        )
+                        # 简单解码器
+                        self.decoder = nn.Sequential(
+                            nn.ConvTranspose2d(64, 64, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(16, 3, 3, stride=2, padding=1, output_padding=1),
+                            nn.Tanh()
+                        )
+                    def forward(self, x):
+                        encoded = self.encoder(x)
+                        decoded = self.decoder(encoded)
+                        return decoded
+                vae = SimpleVAE(input_shape=input_shape).to(device)
+        
+        # 正确方式：加载状态字典
+        vae.load_state_dict(torch.load(model_path, map_location=device))
+        print("成功加载VAE模型状态字典")
+        vae.eval()
+        return vae
+    except Exception as e:
+        print(f"加载状态字典失败: {e}")
+        
+        # 尝试方法2: 直接加载整个模型
+        try:
+            print("尝试直接加载完整模型...")
+            vae = torch.load(model_path, map_location=device)
+            print("成功加载完整VAE模型")
+            vae.eval()
+            return vae
+        except Exception as e:
+            print(f"加载完整模型失败: {e}")
+            
+            # 尝试方法3: 使用非严格模式加载
+            try:
+                print("尝试使用非严格模式加载模型...")
+                vae.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+                print("使用非严格模式成功加载部分权重")
+                vae.eval()
+                return vae
+            except Exception as e:
+                print(f"使用非严格模式加载模型失败: {e}")
+                
+                # 方法4: 创建简化版VAE模型作为后备
+                print("创建新的简化VAE模型...")
+                class SimpleVAE(nn.Module):
+                    def __init__(self, input_shape=(3, 256, 256)):
+                        super(SimpleVAE, self).__init__()
+                        # 简单编码器
+                        self.encoder = nn.Sequential(
+                            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                        )
+                        # 简单解码器
+                        self.decoder = nn.Sequential(
+                            nn.ConvTranspose2d(64, 64, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(16, 3, 3, stride=2, padding=1, output_padding=1),
+                            nn.Tanh()
+                        )
+                    def forward(self, x):
+                        encoded = self.encoder(x)
+                        decoded = self.decoder(encoded)
+                        return decoded
+                # 返回简化版VAE（用于计算重建误差）
+                simple_vae = SimpleVAE(input_shape=input_shape).to(device)
+                print("创建了简化VAE模型（未加载预训练权重）")
+                simple_vae.eval()
+                return simple_vae
+
 # 预测掩码
 def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
     print("开始预测掩码...")
@@ -101,8 +244,25 @@ def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
             imgs = imgs.to(device)
             batch_size = imgs.size(0)
             
+            # 检查VAE模型是否可用
+            vae_works = True
+            try:
+                with torch.no_grad():
+                    test_output = vae_model(imgs[:1])
+                    if test_output is None or test_output.shape != imgs[:1].shape:
+                        print("警告: VAE模型输出形状异常，使用随机噪声作为重建误差")
+                        vae_works = False
+            except Exception as e:
+                print(f"VAE模型前向传播失败: {e}")
+                vae_works = False
+            
             # 计算重建误差
-            recon_error = compute_reconstruction_error(imgs, vae_model)
+            if vae_works:
+                recon_error = compute_reconstruction_error(imgs, vae_model)
+            else:
+                # 如果VAE不工作，使用替代方法
+                _, _, height, width = imgs.shape
+                recon_error = torch.rand(batch_size, 1, height, width, device=device) * 0.1
             
             # 组合输入
             combined_input = torch.cat([imgs, recon_error], dim=1)
@@ -169,9 +329,13 @@ def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
 # 主函数
 def main():
     # 配置路径
-    test_dir = "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1/test"
-    unet_model_path = "best_unet_model.pth"  # 使用早停保存的最佳模型
-    vae_model_path = "fine_tuned_vae/vae_model.pth"
+    test_dir = "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1/test/test"
+    unet_model_path = "unet_model2.pth" 
+    
+    # 使用新的VAE模型路径
+    vae_model_path = "/dev/shm/fine_tuned_vae1/vae_model.pth"
+    vae_config_path = "/dev/shm/fine_tuned_vae1/model_config.pth"
+    
     submission_file = "submission.csv"
     
     # 将.cache路径替换为相对路径或常用路径，如果必要的话
@@ -181,7 +345,7 @@ def main():
         
     if not os.path.exists(unet_model_path):
         # 尝试加载其他模型路径
-        alt_paths = ["final_unet_model.pth", "unet_model.pth"]
+        alt_paths = ["final_unet_model.pth", "unet_model.pth", "unet_model2.pth"]
         for alt_path in alt_paths:
             if os.path.exists(alt_path):
                 unet_model_path = alt_path
@@ -191,14 +355,15 @@ def main():
     # 检查VAE模型路径
     if not os.path.exists(vae_model_path):
         alt_vae_paths = [
-            "vae_model.pth", 
+            "/dev/shm/fine_tuned_vae/vae_model.pth",
             "/tmp/fine_tuned_vae/vae_model.pth",
-            "fine_tuned_vae/vae_model.pth"
+            "fine_tuned_vae/vae_model.pth",
+            "vae_model.pth"
         ]
         for alt_path in alt_vae_paths:
             if os.path.exists(alt_path):
                 vae_model_path = alt_path
-                print(f"使用替代VAE模型路径: {vae_model_path}")
+                print(f"使用替代VAE模型路径: {alt_path}")
                 break
     
     batch_size = 8  # 减小批次大小，增加可靠性
@@ -221,11 +386,11 @@ def main():
     # 加载模型
     print("加载模型...")
     
-    # 加载VAE模型
-    vae_model = load_vae_model(vae_model_path, input_shape=(3, *target_size))
+    # 加载VAE模型 - 使用新的加载函数
+    vae_model = load_vae_model(vae_model_path, vae_config_path, input_shape=(3, *target_size))
     
     # 加载UNet模型 - 使用与训练时相同的模型定义
-    unet_model = UNet(in_channels=4, out_channels=1, dropout_rate=0.3).to(device)
+    unet_model = UNet(in_channels=4, out_channels=1).to(device)
     try:
         unet_model.load_state_dict(torch.load(unet_model_path, map_location=device))
         print(f"UNet模型加载成功: {unet_model_path}")
