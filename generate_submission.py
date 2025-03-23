@@ -222,7 +222,7 @@ def load_vae_model(model_path, config_path=None, input_shape=(3, 256, 256), late
                 simple_vae.eval()
                 return simple_vae
 
-# 预测掩码
+# 预测掩码 - 严格遵循unet_validate.py中的实现
 def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
     print("开始预测掩码...")
     results = []
@@ -230,41 +230,25 @@ def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
     unet_model.eval()
     vae_model.eval()
     
-    # 尝试加载最佳阈值
-    try:
-        with open("best_threshold.txt", "r") as f:
-            best_threshold = float(f.read().strip())
-            print(f"使用训练中找到的最佳阈值: {best_threshold}")
-            threshold = best_threshold
-    except:
-        print(f"使用默认阈值: {threshold}")
+    # 移除加载阈值的代码，使用固定阈值
+    print(f"使用固定阈值: {threshold}")
     
     with torch.no_grad():
         for imgs, img_ids in tqdm(test_loader, desc="预测中"):
             imgs = imgs.to(device)
             batch_size = imgs.size(0)
             
-            # 检查VAE模型是否可用
-            vae_works = True
+            # 计算重建误差 - 与unet_validate.py一致的实现方式
             try:
-                with torch.no_grad():
-                    test_output = vae_model(imgs[:1])
-                    if test_output is None or test_output.shape != imgs[:1].shape:
-                        print("警告: VAE模型输出形状异常，使用随机噪声作为重建误差")
-                        vae_works = False
-            except Exception as e:
-                print(f"VAE模型前向传播失败: {e}")
-                vae_works = False
-            
-            # 计算重建误差
-            if vae_works:
+                # 尝试使用VAE模型计算重建误差
                 recon_error = compute_reconstruction_error(imgs, vae_model)
-            else:
-                # 如果VAE不工作，使用替代方法
+            except Exception as e:
+                print(f"使用VAE计算重建误差时出错: {e}")
+                # 如果VAE不工作，使用替代方法生成随机噪声
                 _, _, height, width = imgs.shape
                 recon_error = torch.rand(batch_size, 1, height, width, device=device) * 0.1
             
-            # 组合输入
+            # 组合输入 - 与unet_validate.py一致
             combined_input = torch.cat([imgs, recon_error], dim=1)
             
             # 预测掩码
@@ -275,19 +259,11 @@ def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
                 # 获取预测掩码
                 mask_np = mask_preds[i].squeeze().cpu().numpy()
                 
-                # 根据图像特性自适应调整阈值
-                if np.mean(mask_np) > 0.2:  # 如果平均预测值较高，提高阈值减少误报
-                    adaptive_threshold = threshold + 0.05
-                elif np.mean(mask_np) < 0.05:  # 如果平均预测值较低，适当降低阈值
-                    adaptive_threshold = threshold - 0.05
-                else:
-                    adaptive_threshold = threshold
+                # 二值化 - 使用固定阈值，不再根据图像特性自适应调整
+                binary_mask = (mask_np > threshold).astype(np.uint8)
                 
-                # 二值化
-                binary_mask = (mask_np > adaptive_threshold).astype(np.uint8)
-                
-                # 增强后处理
-                # 1. 开操作去除噪点
+                # 后处理 - 与unet_validate.py一致
+                # 1. 形态学开操作去除噪点
                 kernel = np.ones((3, 3), np.uint8)
                 refined_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel, iterations=1)
                 
@@ -305,23 +281,13 @@ def predict_masks(unet_model, vae_model, test_loader, threshold=0.5):
                     # 保留大连通区域
                     clean_mask[labels == j] = 1
                 
-                # 4. 边缘增强 - 使用Canny边缘检测器找到边缘，然后略微扩张
-                if np.any(clean_mask):  # 只在有非零像素时执行
-                    edges = cv2.Canny(clean_mask.astype(np.uint8) * 255, 50, 150)
-                    edges_dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-                    
-                    # 将边缘与掩码合并
-                    final_mask = clean_mask | (edges_dilated > 0).astype(np.uint8)
-                else:
-                    final_mask = clean_mask
-                
                 # 转换为RLE
-                rle = mask2rle(final_mask)
+                rle = mask2rle(clean_mask)
                 
                 # 添加到结果列表
                 results.append({
                     'ImageId': img_ids[i],
-                    'EncodedPixels': rle if np.any(final_mask) else ''  # 如果掩码为空，则提交空字符串
+                    'EncodedPixels': rle if np.any(clean_mask) else ''  # 如果掩码为空，则提交空字符串
                 })
     
     return results
@@ -332,30 +298,40 @@ def main():
     test_dir = "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1/test/test"
     unet_model_path = "unet_model2.pth" 
     
-    # 使用新的VAE模型路径
+    # 使用新的VAE模型路径，与unet_validate.py一致
     vae_model_path = "/dev/shm/fine_tuned_vae1/vae_model.pth"
     vae_config_path = "/dev/shm/fine_tuned_vae1/model_config.pth"
     
     submission_file = "submission.csv"
     
-    # 将.cache路径替换为相对路径或常用路径，如果必要的话
+    # 处理测试目录路径
     if not os.path.exists(test_dir):
-        test_dir = os.path.join("data", "test")
-        print(f"使用替代测试目录: {test_dir}")
-        
+        # 尝试多个可能的测试目录
+        alt_test_dirs = [
+            os.path.join("data", "test"),
+            "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1/test/test",
+            "test"
+        ]
+        for alt_dir in alt_test_dirs:
+            if os.path.exists(alt_dir):
+                test_dir = alt_dir
+                print(f"使用替代测试目录: {test_dir}")
+                break
+    
+    # 处理UNet模型路径 - 与unet_validate.py一致的查找顺序
     if not os.path.exists(unet_model_path):
-        # 尝试加载其他模型路径
-        alt_paths = ["final_unet_model.pth", "unet_model.pth", "unet_model2.pth"]
+        alt_paths = ["unet_model.pth", "best_unet_model.pth", "final_unet_model.pth"]
         for alt_path in alt_paths:
             if os.path.exists(alt_path):
                 unet_model_path = alt_path
                 print(f"使用替代UNet模型路径: {unet_model_path}")
                 break
     
-    # 检查VAE模型路径
+    # 处理VAE模型路径 - 与unet_validate.py一致的查找顺序
     if not os.path.exists(vae_model_path):
         alt_vae_paths = [
             "/dev/shm/fine_tuned_vae/vae_model.pth",
+            "/dev/shm/fine_tuned_vae/vae_complete_model.pth",
             "/tmp/fine_tuned_vae/vae_model.pth",
             "fine_tuned_vae/vae_model.pth",
             "vae_model.pth"
@@ -366,14 +342,12 @@ def main():
                 print(f"使用替代VAE模型路径: {alt_path}")
                 break
     
-    batch_size = 8  # 减小批次大小，增加可靠性
+    batch_size = 8
     target_size = (256, 256)
-    threshold = 0.5  # 默认阈值，将被best_threshold.txt中的值覆盖（如果存在）
-    
-    # 加载测试集路径
+    threshold = 0.8
+
     test_images_paths = load_test_images(test_dir)
-    
-    # 创建测试数据集和数据加载器
+
     test_dataset = TestDataset(test_images_paths, target_size)
     test_loader = DataLoader(
         test_dataset, 
@@ -382,14 +356,11 @@ def main():
         num_workers=4, 
         pin_memory=True
     )
-    
-    # 加载模型
+
     print("加载模型...")
-    
-    # 加载VAE模型 - 使用新的加载函数
+
     vae_model = load_vae_model(vae_model_path, vae_config_path, input_shape=(3, *target_size))
-    
-    # 加载UNet模型 - 使用与训练时相同的模型定义
+
     unet_model = UNet(in_channels=4, out_channels=1).to(device)
     try:
         unet_model.load_state_dict(torch.load(unet_model_path, map_location=device))
@@ -404,7 +375,7 @@ def main():
             print(f"非严格加载UNet模型时出错: {e}")
             return
     
-    # 预测掩码
+    # 预测掩码 - 使用固定阈值
     results = predict_masks(unet_model, vae_model, test_loader, threshold)
     
     # 创建提交文件
