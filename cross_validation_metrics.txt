@@ -1,0 +1,43 @@
+Fold 1:
+  accuracy: 0.6789
+  precision: 0.0000
+  recall: 0.0000
+  f1_score: 0.0000
+  mean_iou: 0.0906
+  mean_dice: 0.0906
+Fold 2:
+  accuracy: 0.6805
+  precision: 0.0000
+  recall: 0.0000
+  f1_score: 0.0000
+  mean_iou: 0.0911
+  mean_dice: 0.0911
+Fold 3:
+  accuracy: 0.3136
+  precision: 0.3136
+  recall: 1.0000
+  f1_score: 0.4775
+  mean_iou: 0.3136
+  mean_dice: 0.3850
+Fold 4:
+  accuracy: 0.6763
+  precision: 0.0000
+  recall: 0.0000
+  f1_score: 0.0000
+  mean_iou: 0.0906
+  mean_dice: 0.0906
+Fold 5:
+  accuracy: 0.6864
+  precision: 0.0000
+  recall: 0.0000
+  f1_score: 0.0000
+  mean_iou: 0.0995
+  mean_dice: 0.0995
+
+Average:
+  accuracy: 0.6071
+  precision: 0.0627
+  recall: 0.2000
+  f1_score: 0.0955
+  mean_iou: 0.1371
+  mean_dice: 0.1514

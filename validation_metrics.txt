@@ -1,0 +1,6 @@
+accuracy: 0.8557
+precision: 0.7898
+recall: 0.7373
+f1_score: 0.7627
+mean_iou: 0.5539
+mean_dice: 0.6405

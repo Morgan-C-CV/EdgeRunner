@@ -1,0 +1,6 @@
+*.png
+*.pth
+*.csv
+*json
+*.pyc
+*.deb
