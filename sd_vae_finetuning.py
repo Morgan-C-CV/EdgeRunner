@@ -75,44 +75,67 @@ class ImprovedDecoder(nn.Module):
         
         self.fc = nn.Linear(latent_dim, 256 * self.initial_height * self.initial_width)
         
+        # 匹配原始模型的initial_block
         self.initial_block = nn.Sequential(
             nn.ConvTranspose2d(256, 256, kernel_size=3, stride=1, padding=1),
             nn.ReLU()
         )
         
-        # 添加残差块
+        # 添加残差块，与原始模型匹配
         self.res1 = ResBlock(256)
         self.res2 = ResBlock(128)
         
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+        # 匹配原始模型的detail_enhance结构和形状
+        self.detail_enhance = nn.Sequential(
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),  # [16, 3, 3, 3]
             nn.ReLU(),
-            # 这里插入 res2
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),  # [16, 16, 3, 3]
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.Tanh()
+            nn.Conv2d(16, 3, kernel_size=3, padding=1),   # [3, 16, 3, 3]
+            nn.ReLU()
         )
         
-        # 在解码器中添加更多细节层
-        self.final_detail = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            ResBlock(32),
-            nn.Conv2d(32, 3, kernel_size=3, padding=1),
-            nn.Tanh()
+        # 匹配原始模型的decoder结构
+        self.decoder = nn.Sequential(
+            nn.Sequential(
+                nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.ReLU()
+            ),
+            nn.Sequential(
+                nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.ReLU()
+            ),
+            nn.Sequential(
+                nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.ReLU()
+            ),
+            nn.Sequential(
+                nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 3, kernel_size=3, padding=1),
+                nn.Tanh()
+            )
+        )
+        
+        # 匹配原始模型的smoothing结构
+        self.smoothing = nn.Sequential(
+            nn.Conv2d(3, 3, kernel_size=3, padding=1, groups=3)  # 使用分组卷积匹配 [3, 1, 3, 3]
         )
     
     def forward(self, x):
         x = self.fc(x)
         x = x.view(-1, 256, self.initial_height, self.initial_width)
-        x = self.initial_block(x)
-        x = self.res1(x)
-        x = self.decoder[0:2](x)  # 前两层
-        x = self.res2(x)
-        x = self.decoder[2:](x)   # 剩余层
+        x = self.initial_block(x)  # 使用initial_block处理
+        x = self.res1(x)  # 应用第一个残差块
+        
+        # 按原始模型的方式处理
+        x = self.decoder[0](x)  # 第一层转置卷积
+        x = self.res2(x)  # 应用第二个残差块
+        x = self.decoder[1](x)  # 第二层转置卷积
+        x = self.decoder[2](x)  # 第三层转置卷积
+        x = self.decoder[3](x)  # 第四层转置卷积 + 额外层 
+        
+        # 现在x的形状应该是 [batch_size, 3, H, W]
         return x
 
 class VAE(nn.Module):
@@ -309,11 +332,37 @@ def save_model(vae, output_dir="fine_tuned_vae"):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    torch.save(vae.state_dict(), os.path.join(output_dir, "/dev/shm/fine_tuned_vae/vae_model.pth"))
-    torch.save(vae.encoder.state_dict(), os.path.join(output_dir, "encoder_model.pth"))
-    torch.save(vae.decoder.state_dict(), os.path.join(output_dir, "decoder_model.pth"))
+    # 确保新目录存在
+    os.makedirs("/dev/shm/fine_tuned_vae1/", exist_ok=True)
     
-    print(f"模型已保存到 {output_dir}")
+    # 保存完整模型到新位置（不覆盖原有模型）
+    torch.save(vae, os.path.join("/dev/shm/fine_tuned_vae1/", "vae_complete_model.pth"))
+    
+    # 保存状态字典到新位置
+    torch.save(vae.state_dict(), os.path.join("/dev/shm/fine_tuned_vae1/", "vae_model.pth"))
+    
+    # 分别保存编码器和解码器到新位置
+    torch.save(vae.encoder.state_dict(), os.path.join("/dev/shm/fine_tuned_vae1/", "encoder_model.pth"))
+    torch.save(vae.decoder.state_dict(), os.path.join("/dev/shm/fine_tuned_vae1/", "decoder_model.pth"))
+    
+    # 导出模型结构信息到新位置
+    with open(os.path.join("/dev/shm/fine_tuned_vae1/", "model_structure.txt"), "w") as f:
+        f.write(str(vae))
+    
+    # 导出模型架构代码到新位置
+    import inspect
+    with open(os.path.join("/dev/shm/fine_tuned_vae1/", "model_code.py"), "w") as f:
+        f.write(inspect.getsource(VAE))
+        f.write("\n\n")
+        f.write(inspect.getsource(Encoder))
+        f.write("\n\n")
+        f.write(inspect.getsource(ImprovedDecoder))
+        f.write("\n\n")
+        f.write(inspect.getsource(ResBlock))
+    
+    print(f"模型已保存到新位置: /dev/shm/fine_tuned_vae1/")
+    print(f"完整模型: /dev/shm/fine_tuned_vae1/vae_complete_model.pth")
+    print(f"状态字典: /dev/shm/fine_tuned_vae1/vae_model.pth")
 
 # 使用VGG特征提取器计算感知损失
 class PerceptualLoss(nn.Module):
