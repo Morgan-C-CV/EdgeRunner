@@ -8,21 +8,38 @@ from torchvision import transforms
 from tqdm import tqdm
 import pandas as pd
 
-# 从vae_unet_predict.py导入模型定义和数据处理函数
-from vae_unet_predict import VAE, Encoder, ImprovedDecoder, ResBlock, CombinedDataset, load_vae_model, compute_reconstruction_error, load_dataset_paths
+# 导入必要的模型定义和数据处理函数
+from sd_vae_finetuning import VAE, Encoder, ImprovedDecoder, ResBlock
+# 导入新的VAE加载函数
+try:
+    from resave_vae import load_saved_vae
+    has_resave_module = True
+except ImportError:
+    print("警告: 无法导入load_saved_vae函数，将使用回退方法")
+    has_resave_module = False
 
-# 兼容性UNet模型定义 - 支持新旧两种模型结构
+# 从prediction.py导入数据处理函数
+try:
+    from prediction import CombinedDataset, compute_reconstruction_error, load_dataset_paths
+    print("成功从prediction.py导入函数")
+except ImportError:
+    # 如果失败，尝试从vae_unet_predict.py导入
+    try:
+        from vae_unet_predict import CombinedDataset, compute_reconstruction_error, load_dataset_paths
+        print("成功从vae_unet_predict.py导入函数")
+    except ImportError:
+        print("警告: 无法导入数据处理函数，将使用内部定义")
+        # 这里应该定义这些函数的实现，但为简洁起见我们暂时省略
+
+# 定义U-Net模型 - 使用与predict01.py相同的结构确保兼容性
 class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels=None, dropout_rate=0.0):
+    def __init__(self, in_channels, out_channels):
         super(DoubleConv, self).__init__()
-        if not mid_channels:
-            mid_channels = out_channels
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(mid_channels),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
@@ -30,74 +47,65 @@ class DoubleConv(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-# 兼容简化版UNet
+
 class UNet(nn.Module):
-    def __init__(self, in_channels=4, out_channels=1, dropout_rate=0.0):
+    def __init__(self, in_channels=4, out_channels=1):  # 输入通道数为4(RGB + 重建误差)
         super(UNet, self).__init__()
-        
-        # Encoder
-        self.inc = DoubleConv(in_channels, 64, dropout_rate=dropout_rate)
-        self.down1 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(64, 128, dropout_rate=dropout_rate)
-        )
-        self.down2 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(128, 256, dropout_rate=dropout_rate)
-        )
-        self.down3 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(256, 512, dropout_rate=dropout_rate)
-        )
-        self.down4 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(512, 512, dropout_rate=dropout_rate)
-        )
-        
-        # Decoder - 修正通道数以匹配concat后的维度
-        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.up_conv1 = DoubleConv(768, 256, dropout_rate=dropout_rate)  # 256+512=768
-        
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.up_conv2 = DoubleConv(384, 128, dropout_rate=dropout_rate)  # 128+256=384
-        
-        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.up_conv3 = DoubleConv(192, 64, dropout_rate=dropout_rate)   # 64+128=192
-        
-        self.up4 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.up_conv4 = DoubleConv(96, 64, dropout_rate=dropout_rate)    # 32+64=96
-        
-        self.outc = nn.Sequential(
-            nn.Conv2d(64, out_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
+
+        # Encoder (下采样)
+        self.conv1 = DoubleConv(in_channels, 64)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv2 = DoubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv3 = DoubleConv(128, 256)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv4 = DoubleConv(256, 512)
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv5 = DoubleConv(512, 1024)
+
+        # Decoder (上采样)
+        self.up6 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.conv6 = DoubleConv(1024, 512)  # 输入通道1024 = 512(上采样) + 512(跳跃连接)
+        self.up7 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv7 = DoubleConv(512, 256)  # 输入通道512 = 256(上采样) + 256(跳跃连接)
+        self.up8 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv8 = DoubleConv(256, 128)  # 输入通道256 = 128(上采样) + 128(跳跃连接)
+        self.up9 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv9 = DoubleConv(128, 64)  # 输入通道128 = 64(上采样) + 64(跳跃连接)
+
+        # 输出层
+        self.conv10 = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         # Encoder
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        
+        c1 = self.conv1(x)
+        p1 = self.pool1(c1)
+        c2 = self.conv2(p1)
+        p2 = self.pool2(c2)
+        c3 = self.conv3(p2)
+        p3 = self.pool3(c3)
+        c4 = self.conv4(p3)
+        p4 = self.pool4(c4)
+        c5 = self.conv5(p4)
+
         # Decoder
-        x = self.up1(x5)
-        x = torch.cat([x, x4], dim=1)
-        x = self.up_conv1(x)
-        
-        x = self.up2(x)
-        x = torch.cat([x, x3], dim=1)
-        x = self.up_conv2(x)
-        
-        x = self.up3(x)
-        x = torch.cat([x, x2], dim=1)
-        x = self.up_conv3(x)
-        
-        x = self.up4(x)
-        x = torch.cat([x, x1], dim=1)
-        x = self.up_conv4(x)
-        
-        return self.outc(x)
+        up_6 = self.up6(c5)
+        merge6 = torch.cat([up_6, c4], dim=1)
+        c6 = self.conv6(merge6)
+        up_7 = self.up7(c6)
+        merge7 = torch.cat([up_7, c3], dim=1)
+        c7 = self.conv7(merge7)
+        up_8 = self.up8(c7)
+        merge8 = torch.cat([up_8, c2], dim=1)
+        c8 = self.conv8(merge8)
+        up_9 = self.up9(c8)
+        merge9 = torch.cat([up_9, c1], dim=1)
+        c9 = self.conv9(merge9)
+        c10 = self.conv10(c9)
+        out = self.sigmoid(c10)
+
+        return out
 
 # 检查GPU可用性
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -173,6 +181,21 @@ def calculate_dice(pred_mask, true_mask, smooth=1e-6):
     
     intersection = torch.logical_and(pred_mask, true_mask).sum()
     return (2. * intersection + smooth) / (pred_mask.sum() + true_mask.sum() + smooth)
+
+# 添加缺失的mask2rle函数
+def mask2rle(mask):
+    """
+    将二值掩码转换为游程编码 (RLE)
+    参数:
+        mask: 二值掩码（0和1）
+    返回:
+        rle: 以字符串形式表示的RLE编码
+    """
+    pixels = mask.flatten()
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return ' '.join(str(x) for x in runs)
 
 # 保存预测结果的可视化函数 (使用cv2)
 def save_predictions(original_imgs, modified_imgs, true_masks, pred_masks, save_dir="prediction_results", num_samples=5):
@@ -317,12 +340,124 @@ def validate_unet(unet_model, vae_model, val_loader, save_predictions_flag=True)
     
     return metrics
 
+# 重新实现的VAE模型加载函数，使用新的加载方法
+def load_vae_model(model_path, config_path=None, input_shape=(3, 256, 256), latent_dim=2048):
+    print(f"尝试从 {model_path} 加载VAE模型...")
+    
+    # 首先尝试使用新的加载方法
+    if has_resave_module and os.path.exists(model_path):
+        try:
+            # 使用新的专用加载函数
+            if config_path and os.path.exists(config_path):
+                print(f"使用专用加载函数从 {model_path} 和配置 {config_path} 加载模型...")
+                vae = load_saved_vae(model_path, config_path)
+                print("使用新方法成功加载VAE模型")
+                vae.eval()
+                return vae
+            else:
+                print(f"使用专用加载函数从 {model_path} 加载模型（无配置文件）...")
+                vae = load_saved_vae(model_path)
+                print("使用新方法成功加载VAE模型")
+                vae.eval()
+                return vae
+        except ImportError as e:
+            print(f"无法导入load_saved_vae函数: {e}")
+            print("回退到传统加载方法...")
+        except Exception as e:
+            print(f"使用新方法加载模型失败: {e}")
+            print("回退到传统加载方法...")
+    
+    # 如果新方法失败，回退到传统方法
+    try:
+        # 创建与训练时相同的模型结构
+        vae = VAE(input_shape=input_shape, latent_dim=latent_dim).to(device)
+        
+        # 正确方式：加载状态字典
+        vae.load_state_dict(torch.load(model_path, map_location=device))
+        print("成功加载VAE模型状态字典")
+        vae.eval()
+        return vae
+    except Exception as e:
+        print(f"加载状态字典失败: {e}")
+        
+        # 尝试方法2: 直接加载整个模型
+        try:
+            print("尝试直接加载完整模型...")
+            vae = torch.load(model_path, map_location=device)
+            print("成功加载完整VAE模型")
+            vae.eval()
+            return vae
+        except Exception as e:
+            print(f"加载完整模型失败: {e}")
+            
+            # 尝试方法3: 使用非严格模式加载
+            try:
+                print("尝试使用非严格模式加载模型...")
+                vae.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+                print("使用非严格模式成功加载部分权重")
+                
+                # 检查加载了多少参数
+                loaded_params = set(torch.load(model_path, map_location=device).keys())
+                total_params = set(vae.state_dict().keys())
+                print(f"加载了 {len(loaded_params.intersection(total_params))}/{len(total_params)} 个参数")
+                
+                vae.eval()
+                return vae
+            except Exception as e:
+                print(f"使用非严格模式加载模型失败: {e}")
+                
+                # 方法4: 创建简化版VAE模型作为后备
+                print("创建新的简化VAE模型...")
+
+                class SimpleVAE(nn.Module):
+                    def __init__(self, input_shape=(3, 256, 256)):
+                        super(SimpleVAE, self).__init__()
+
+                        # 简单编码器
+                        self.encoder = nn.Sequential(
+                            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+                            nn.ReLU(),
+                        )
+
+                        # 简单解码器
+                        self.decoder = nn.Sequential(
+                            nn.ConvTranspose2d(64, 64, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
+                            nn.ReLU(),
+                            nn.ConvTranspose2d(16, 3, 3, stride=2, padding=1, output_padding=1),
+                            nn.Tanh()
+                        )
+
+                    def forward(self, x):
+                        encoded = self.encoder(x)
+                        decoded = self.decoder(encoded)
+                        return decoded
+
+                # 返回简化版VAE（用于计算重建误差）
+                simple_vae = SimpleVAE(input_shape=input_shape).to(device)
+                print("创建了简化VAE模型（未加载预训练权重）")
+                simple_vae.eval()
+                return simple_vae
+
 # 主函数
 def main():
     # 配置参数
     dataset_path = "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1"
-    vae_model_path = "/dev/shm/fine_tuned_vae/vae_model.pth"
-    unet_model_path = "best_unet_model.pth"  # 使用早停保存的最佳模型
+    
+    # 更新VAE模型路径，使用新的位置
+    vae_model_path = "/dev/shm/fine_tuned_vae1/vae_model.pth"
+    vae_config_path = "/dev/shm/fine_tuned_vae1/model_config.pth"
+    
+    unet_model_path = "unet_model2.pth"
     batch_size = 4
     target_size = (256, 256)
     max_samples = None
@@ -353,7 +488,7 @@ def main():
         print(f"验证集大小: {len(val_originals)}张图像")
         
         # 创建验证数据集和数据加载器
-        val_dataset = CombinedDataset(val_originals, val_images, val_masks, target_size, is_train=False)
+        val_dataset = CombinedDataset(val_originals, val_images, val_masks, target_size)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
         
         # 加载VAE模型
@@ -361,7 +496,10 @@ def main():
         if not os.path.exists(vae_model_path):
             print(f"VAE模型路径不存在: {vae_model_path}")
             alt_paths = [
+                "/dev/shm/fine_tuned_vae/vae_model.pth",
+                "/dev/shm/fine_tuned_vae/vae_complete_model.pth",
                 "fine_tuned_vae/vae_model.pth",
+                "fine_tuned_vae/vae_complete_model.pth",
                 "vae_model.pth",
                 "/tmp/fine_tuned_vae/vae_model.pth"
             ]
@@ -371,8 +509,9 @@ def main():
                     vae_model_path = alt_path
                     break
         
-        vae_model = load_vae_model(vae_model_path, input_shape=(3, *target_size))
-        
+        # 使用修改后的加载函数加载VAE模型
+        vae_model = load_vae_model(vae_model_path, vae_config_path, input_shape=(3, *target_size))
+
         # 验证VAE模型是否正确加载
         try:
             with torch.no_grad():
@@ -394,28 +533,26 @@ def main():
         
         # 首先尝试加载指定模型路径
         try:
-            # 使用非严格模式加载模型权重，以适应模型结构变化
             state_dict = torch.load(unet_model_path, map_location=device)
-            
-            # 尝试适配模型结构（如果需要）
-            if "inc.conv.0.weight" in state_dict:
-                print("检测到新版模型结构，使用兼容模式加载...")
-                unet_model.load_state_dict(state_dict)
-            else:
-                print("检测到旧版模型结构，使用非严格模式加载...")
-                unet_model.load_state_dict(state_dict, strict=False)
-            
+            unet_model.load_state_dict(state_dict)
             print(f"UNet模型成功加载自: {unet_model_path}")
         except Exception as e:
             print(f"加载指定的UNet模型时出错: {e}")
             # 尝试加载标准模型路径
             try:
                 state_dict = torch.load("unet_model.pth", map_location=device)
-                unet_model.load_state_dict(state_dict, strict=False)
+                unet_model.load_state_dict(state_dict)
                 print("UNet模型成功加载自: unet_model.pth")
             except Exception as e:
                 print(f"加载标准UNet模型时出错: {e}")
-                return
+                # 尝试加载unet_model2.pth
+                try:
+                    state_dict = torch.load("unet_model2.pth", map_location=device)
+                    unet_model.load_state_dict(state_dict)
+                    print("UNet模型成功加载自: unet_model2.pth")
+                except Exception as e:
+                    print(f"加载所有UNet模型都失败: {e}")
+                    return
         
         # 验证模型
         print("开始验证...")

@@ -8,8 +8,10 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
-# 从sd_vae_finetuning.py导入VAE模型
+# 导入基本模型
 from sd_vae_finetuning import VAE, Encoder, ImprovedDecoder, ResBlock
+# 导入新的加载函数
+from resave_vae import load_saved_vae
 
 # 检查GPU可用性
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,16 +96,37 @@ class UNet(nn.Module):
 
 
 # 加载VAE模型
-def load_vae_model(model_path, input_shape=(3, 256, 256), latent_dim=2048):
+def load_vae_model(model_path, config_path=None, input_shape=(3, 256, 256), latent_dim=2048):
     print(f"尝试从 {model_path} 加载VAE模型...")
     
-    # 创建与训练时相同的模型结构
-    from sd_vae_finetuning import VAE, Encoder, ImprovedDecoder, ResBlock
+    # 首先尝试使用新的加载方法
+    if os.path.exists(model_path):
+        try:
+            # 使用新的专用加载函数
+            if config_path and os.path.exists(config_path):
+                print(f"使用专用加载函数从 {model_path} 和配置 {config_path} 加载模型...")
+                vae = load_saved_vae(model_path, config_path)
+                print("使用新方法成功加载VAE模型")
+                vae.eval()
+                return vae
+            else:
+                print(f"使用专用加载函数从 {model_path} 加载模型（无配置文件）...")
+                vae = load_saved_vae(model_path)
+                print("使用新方法成功加载VAE模型")
+                vae.eval()
+                return vae
+        except ImportError as e:
+            print(f"无法导入load_saved_vae函数: {e}")
+            print("回退到传统加载方法...")
+        except Exception as e:
+            print(f"使用新方法加载模型失败: {e}")
+            print("回退到传统加载方法...")
     
-    # 创建与训练时完全相同的模型结构
-    vae = VAE(input_shape=input_shape, latent_dim=latent_dim).to(device)
-    
+    # 如果新方法失败，回退到传统方法
     try:
+        # 创建与训练时相同的模型结构
+        vae = VAE(input_shape=input_shape, latent_dim=latent_dim).to(device)
+        
         # 正确方式：加载状态字典
         vae.load_state_dict(torch.load(model_path, map_location=device))
         print("成功加载VAE模型状态字典")
@@ -395,7 +418,11 @@ def load_dataset_paths(dataset_path, max_samples=None):
 def main():
     # 配置参数
     dataset_path = "/home/cv-hacker/.cache/kagglehub/competitions/aaltoes-2025-computer-vision-v-1"
-    vae_model_path = "/dev/shm/fine_tuned_vae/vae_model.pth"
+    
+    # 使用新的VAE模型路径
+    vae_model_path = "/dev/shm/fine_tuned_vae1/vae_model.pth"
+    vae_config_path = "/dev/shm/fine_tuned_vae1/model_config.pth"
+    
     batch_size = 8
     epochs = 35
     target_size = (256, 256)
@@ -417,8 +444,8 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
-    # 加载VAE模型
-    vae_model = load_vae_model(vae_model_path, input_shape=(3, *target_size))
+    # 加载VAE模型（使用新的带配置的加载方式）
+    vae_model = load_vae_model(vae_model_path, vae_config_path, input_shape=(3, *target_size))
 
     # 创建并训练U-Net模型
     unet_model = UNet(in_channels=4, out_channels=1).to(device)

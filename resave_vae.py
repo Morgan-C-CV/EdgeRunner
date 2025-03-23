@@ -221,6 +221,24 @@ def create_matching_decoder(original_state_dict):
     
     return MatchingDecoder
 
+# 将CustomVAE类移到全局作用域
+class CustomVAE(nn.Module):
+    def __init__(self, input_shape=(3, 256, 256), latent_dim=2048, matching_decoder_class=None):
+        super(CustomVAE, self).__init__()
+        self.latent_dim = latent_dim
+        self.encoder = Encoder(input_shape, latent_dim)
+        
+        if matching_decoder_class is not None:
+            self.decoder = matching_decoder_class(latent_dim, input_shape)
+        else:
+            # 使用默认的ImprovedDecoder作为回退选项
+            self.decoder = ImprovedDecoder(latent_dim, input_shape)
+            
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
 def resave_vae_model():
     """加载现有VAE模型，使用新的结构重新保存到新目录"""
     
@@ -242,23 +260,11 @@ def resave_vae_model():
     # 创建自定义解码器
     MatchingDecoder = create_matching_decoder(state_dict)
     
-    # 创建自定义的VAE
-    class CustomVAE(nn.Module):
-        def __init__(self, input_shape=(3, 256, 256), latent_dim=2048):
-            super(CustomVAE, self).__init__()
-            self.latent_dim = latent_dim
-            self.encoder = Encoder(input_shape, latent_dim)
-            self.decoder = MatchingDecoder(latent_dim, input_shape)
-            
-        def forward(self, x):
-            encoded = self.encoder(x)
-            decoded = self.decoder(encoded)
-            return decoded
-    
-    # 创建新模型
+    # 创建自定义的VAE（现在使用全局定义的CustomVAE类）
     input_shape = (3, 256, 256)
     latent_dim = 2048
-    new_vae = CustomVAE(input_shape=input_shape, latent_dim=latent_dim).to(device)
+    new_vae = CustomVAE(input_shape=input_shape, latent_dim=latent_dim, 
+                         matching_decoder_class=MatchingDecoder).to(device)
     
     # 打印源模型键和目标模型键
     source_keys = set(state_dict.keys())
@@ -286,10 +292,25 @@ def resave_vae_model():
     torch.save(new_vae.state_dict(), output_path)
     print(f"成功保存模型状态字典到 {output_path}")
     
-    # 同时保存完整模型
-    complete_model_path = os.path.join(new_dir, "vae_complete_model.pth")
-    torch.save(new_vae, complete_model_path)
-    print(f"成功保存完整模型到 {complete_model_path}")
+    # 保存模型结构信息到文本文件
+    model_structure_path = os.path.join(new_dir, "model_structure.txt")
+    with open(model_structure_path, 'w') as f:
+        f.write(str(new_vae))
+    print(f"模型结构已保存到 {model_structure_path}")
+    
+    # 保存模型的配置信息（便于重新构建）
+    config_path = os.path.join(new_dir, "model_config.pth")
+    config = {
+        'input_shape': input_shape,
+        'latent_dim': latent_dim,
+        'has_initial_block': hasattr(new_vae.decoder, 'initial_block'),
+        'has_res1': hasattr(new_vae.decoder, 'res1'),
+        'has_res2': hasattr(new_vae.decoder, 'res2'),
+        'has_detail_enhance': hasattr(new_vae.decoder, 'detail_enhance'),
+        'has_smoothing': hasattr(new_vae.decoder, 'smoothing'),
+    }
+    torch.save(config, config_path)
+    print(f"模型配置已保存到 {config_path}")
     
     # 验证模型是否可用
     try:
@@ -310,6 +331,59 @@ def print_decoder_keys(state_dict_path):
     for k in sorted(decoder_keys):
         print(f"  {k}")
 
+def load_saved_vae(state_dict_path, config_path=None):
+    """
+    加载重保存的VAE模型，自动匹配解码器结构
+    
+    Args:
+        state_dict_path: 状态字典路径
+        config_path: 可选的配置文件路径，用于构建匹配的解码器
+        
+    Returns:
+        加载了权重的VAE模型
+    """
+    print(f"从 {state_dict_path} 加载状态字典...")
+    state_dict = torch.load(state_dict_path, map_location=device)
+    
+    # 尝试加载配置
+    config = None
+    if config_path and os.path.exists(config_path):
+        try:
+            config = torch.load(config_path, map_location=device)
+            print(f"从 {config_path} 加载模型配置")
+        except Exception as e:
+            print(f"加载配置文件失败: {e}")
+    
+    # 分析状态字典以确定解码器结构
+    decoder_type = "custom"
+    input_shape = (3, 256, 256)
+    latent_dim = 2048
+    
+    if config:
+        input_shape = config.get('input_shape', input_shape)
+        latent_dim = config.get('latent_dim', latent_dim)
+    
+    # 基于状态字典创建匹配的解码器
+    MatchingDecoder = create_matching_decoder(state_dict)
+    
+    # 创建自定义VAE
+    vae = CustomVAE(
+        input_shape=input_shape, 
+        latent_dim=latent_dim,
+        matching_decoder_class=MatchingDecoder
+    ).to(device)
+    
+    # 加载状态字典
+    try:
+        vae.load_state_dict(state_dict, strict=False)
+        print("成功加载模型状态字典")
+    except Exception as e:
+        print(f"加载状态字典时出错: {e}")
+        print("尝试手动匹配参数...")
+        vae = manual_copy_tensors(state_dict, vae)
+    
+    return vae
+
 if __name__ == "__main__":
     # 确保目录存在
     os.makedirs("/dev/shm/fine_tuned_vae1/", exist_ok=True)
@@ -322,27 +396,58 @@ if __name__ == "__main__":
     print(f"模型重新保存{'成功' if success else '失败'}")
     
     if success:
-        # 验证新保存的模型
-        test_vae = VAE(input_shape=(3, 256, 256), latent_dim=2048).to(device)
+        # 测试加载我们的自定义模型
         try:
+            print("\n=== 测试加载自定义模型 ===")
+            custom_vae = load_saved_vae(
+                "/dev/shm/fine_tuned_vae1/vae_model.pth",
+                "/dev/shm/fine_tuned_vae1/model_config.pth"
+            )
+            custom_vae.eval()
+            
+            with torch.no_grad():
+                test_input = torch.randn(1, 3, 256, 256).to(device)
+                test_output = custom_vae(test_input)
+                print(f"自定义模型测试成功: 输出形状 {test_output.shape}")
+                
+            # 生成示例代码，帮助用户在其他脚本中加载模型
+            example_code = """
+# 在其他脚本中使用此模型的示例代码:
+from resave_vae import load_saved_vae
+
+# 加载自定义模型
+model = load_saved_vae(
+    "/dev/shm/fine_tuned_vae1/vae_model.pth",
+    "/dev/shm/fine_tuned_vae1/model_config.pth"
+)
+
+# 使用模型进行推理
+model.eval()
+import torch
+with torch.no_grad():
+    # 自定义图像预处理...
+    test_input = torch.randn(1, 3, 256, 256).to(model.device)
+    output = model(test_input)
+"""
+            example_path = os.path.join("/dev/shm/fine_tuned_vae1/", "usage_example.py")
+            with open(example_path, 'w') as f:
+                f.write(example_code)
+            print(f"使用示例已保存到 {example_path}")
+                
+        except Exception as e:
+            print(f"自定义模型测试失败: {e}")
+            
+        # 为了保持兼容性，尝试使用原始VAE类加载模型（这会失败，因为形状不匹配）
+        try:
+            print("\n=== 尝试使用原始VAE类加载（仅供参考） ===")
+            test_vae = VAE(input_shape=(3, 256, 256), latent_dim=2048).to(device)
             test_vae.load_state_dict(torch.load("/dev/shm/fine_tuned_vae1/vae_model.pth", map_location=device), strict=False)
             test_vae.eval()
             
             with torch.no_grad():
                 test_input = torch.randn(1, 3, 256, 256).to(device)
                 test_output = test_vae(test_input)
-                print(f"新模型测试成功: 输出形状 {test_output.shape}")
+                print(f"原始模型结构测试成功: 输出形状 {test_output.shape}")
         except Exception as e:
-            print(f"新模型测试失败: {e}")
-            
-            # 直接加载完整模型测试
-            try:
-                complete_vae = torch.load("/dev/shm/fine_tuned_vae1/vae_complete_model.pth", map_location=device)
-                complete_vae.eval()
-                
-                with torch.no_grad():
-                    test_input = torch.randn(1, 3, 256, 256).to(device)
-                    test_output = complete_vae(test_input)
-                    print(f"完整模型测试成功: 输出形状 {test_output.shape}")
-            except Exception as e:
-                print(f"完整模型测试失败: {e}") 
+            print(f"原始模型结构测试失败（预期的）: {str(e)[:200]}...")
+            print("请使用load_saved_vae函数加载此模型") 
